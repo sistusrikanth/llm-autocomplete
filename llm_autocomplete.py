@@ -3,7 +3,9 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
 from typing import List, Dict, Tuple
 import warnings
 import os
-
+import torch
+import time
+torch.manual_seed(int(time.time())) 
 # Suppress warnings for cleaner output
 warnings.filterwarnings("ignore")
 
@@ -88,79 +90,128 @@ class LLMAutocompleteModel:
             print(f"❌ Error loading fallback model: {e}")
             raise RuntimeError("Could not load any LLM model")
     
-    def predict_next_words(self, word: str, num_predictions: int = 3) -> List[Tuple[str, float]]:
+    def predict_next_words(self, word: str, num_predictions: int = 3) -> List[Tuple[str, float, float]]:
         """
-        Predict the next words using the LLM.
+        Predict the next words using the LLM by calling inference 3 times separately.
+        Each call generates a different next token, and we compute the actual confidence
+        from the model's output probabilities.
         
         Args:
             word: Input word to predict from
-            num_predictions: Number of predictions to return
+            num_predictions: Number of predictions to return (default 3)
             
         Returns:
-            List of (word, confidence) tuples
+            List of (word, confidence, inference_time) tuples sorted by decreasing confidence
         """
-        if not self.generator:
+        if not self.model or not self.tokenizer:
             return []
         
         try:
-            # Prepare the input text
-            input_text = word.strip()
+            # Add context to guide the model
+            context = "You are a next word predictor for special education kids who cant talk. "
             
-            # Generate text
-            results = self.generator(
-                input_text,
-                max_new_tokens=5,  # Generate up to 5 tokens
-                num_return_sequences=num_predictions,
-                temperature=0.8,
-                do_sample=True,
-                pad_token_id=self.tokenizer.eos_token_id,
-                truncation=True,
-                top_p=0.9,
-                top_k=50
-            )
+            # Prepare the input text with context
+            input_text = context + word.strip()
+            
+            # Tokenize the input
+            inputs = self.tokenizer(input_text, return_tensors="pt")
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
             
             predictions = []
-            for i, result in enumerate(results):
-                generated_text = result['generated_text'].strip()
-                
-                # Extract the first few words from generated text
-                words = generated_text.split()
-                if words:
-                    # Take the first word as the prediction
-                    predicted_word = words[0].strip('.,!?;:"')
-                    # Filter out the original word
-                    if predicted_word and predicted_word.lower() not in word.lower().split():
-                        # Calculate a simple confidence score
-                        confidence = 1.0 - (i * 0.1)  # Decreasing confidence
-                        predictions.append((predicted_word, confidence))
+            seen_tokens = set()
             
-            # If we don't have enough unique predictions, generate more
-            if len(predictions) < num_predictions:
-                additional_results = self.generator(
-                    input_text,
-                    max_new_tokens=5,
-                    num_return_sequences=num_predictions * 2,
-                    temperature=0.9,
-                    do_sample=True,
-                    pad_token_id=self.tokenizer.eos_token_id,
-                    truncation=True,
-                    top_p=0.95,
-                    top_k=100
-                )
-                
-                for result in additional_results:
-                    generated_text = result['generated_text'].strip()
-                    words = generated_text.split()
-                    if words:
-                        predicted_word = words[0].strip('.,!?;:"')
-                        if (predicted_word and 
-                            predicted_word.lower() not in word.lower().split() and
-                            predicted_word not in [p[0] for p in predictions]):
-                            confidence = 0.5 - (len(predictions) * 0.05)
-                            predictions.append((predicted_word, confidence))
-                            
-                            if len(predictions) >= num_predictions:
-                                break
+            # Call LLM inference num_predictions times separately
+            for i in range(num_predictions):
+                inference_start = time.time()
+                with torch.no_grad():
+                    # Generate one token at a time with sampling to get diversity
+                    outputs = self.model.generate(
+                        **inputs,
+                        max_new_tokens=1,  # Generate only 1 token
+                        do_sample=True,
+                        temperature=0.7 + (i * 0.1),  # Increase temperature for more diversity
+                        top_p=0.9,
+                        top_k=50,
+                        pad_token_id=self.tokenizer.eos_token_id,
+                        return_dict_in_generate=True,
+                        output_scores=True,
+                    )
+                    
+                    # Get the generated token
+                    generated_token_id = outputs.sequences[0][-1].item()
+                    
+                    # Skip if we've already seen this token
+                    if generated_token_id in seen_tokens:
+                        # Retry with higher temperature
+                        continue
+                    
+                    seen_tokens.add(generated_token_id)
+                    
+                    # Get the logits for the generated token
+                    logits = outputs.scores[0][0]  # Shape: [vocab_size]
+                    
+                    # Convert logits to probabilities using softmax
+                    probs = torch.nn.functional.softmax(logits, dim=-1)
+                    
+                    # Get the probability of the generated token
+                    token_prob = probs[generated_token_id].item()
+                    
+                    # Decode the token to text
+                    predicted_word = self.tokenizer.decode(generated_token_id, skip_special_tokens=True).strip()
+                    
+                    # Clean up the predicted word
+                    predicted_word = predicted_word.strip('.,!?;:"')
+                    
+                    inference_time = time.time() - inference_start
+                    
+                    # Only add if it's a valid word and not in the input
+                    if predicted_word and predicted_word.lower() not in word.lower().split():
+                        predictions.append((predicted_word, token_prob, inference_time))
+            
+            # If we couldn't get enough unique predictions, try again with higher temperature
+            retry_count = 0
+            max_retries = num_predictions * 3
+            
+            while len(predictions) < num_predictions and retry_count < max_retries:
+                retry_start = time.time()
+                with torch.no_grad():
+                    outputs = self.model.generate(
+                        **inputs,
+                        max_new_tokens=1,
+                        do_sample=True,
+                        temperature=1.0 + (retry_count * 0.1),
+                        top_p=0.95,
+                        top_k=100,
+                        pad_token_id=self.tokenizer.eos_token_id,
+                        return_dict_in_generate=True,
+                        output_scores=True,
+                    )
+                    
+                    generated_token_id = outputs.sequences[0][-1].item()
+                    retry_time = time.time() - retry_start
+                    
+                    if generated_token_id not in seen_tokens:
+                        seen_tokens.add(generated_token_id)
+                        
+                        logits = outputs.scores[0][0]
+                        probs = torch.nn.functional.softmax(logits, dim=-1)
+                        token_prob = probs[generated_token_id].item()
+                        
+                        predicted_word = self.tokenizer.decode(generated_token_id, skip_special_tokens=True).strip()
+                        predicted_word = predicted_word.strip('.,!?;:"')
+                        
+                        if predicted_word and predicted_word.lower() not in word.lower().split():
+                            if predicted_word not in [p[0] for p in predictions]:
+                                predictions.append((predicted_word, token_prob, retry_time))
+                    
+                    retry_count += 1
+            
+            # Sort predictions by confidence (probability) in descending order
+            predictions.sort(key=lambda x: x[1], reverse=True)
+            
+            print(f"\n📊 Final predictions (sorted by confidence):")
+            for i, (word, conf, inf_time) in enumerate(predictions[:num_predictions], 1):
+                print(f"   {i}. '{word}' - Confidence: {conf:.6f}, Inference Time: {inf_time:.4f}s")
             
             return predictions[:num_predictions]
             
@@ -216,11 +267,7 @@ def main():
                 print("🔄 Generating predictions...")
                 predictions = model.predict_next_words(user_input, 3)
                 
-                if predictions:
-                    print(f"\n🔮 LLM predictions for '{user_input}':")
-                    for i, (word, confidence) in enumerate(predictions, 1):
-                        print(f"   {i}. '{word}' (confidence: {confidence:.3f})")
-                else:
+                if not predictions:
                     print(f"\n❌ No predictions generated for '{user_input}'")
                 
                 print()

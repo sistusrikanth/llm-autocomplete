@@ -49,10 +49,7 @@ def test_llm_autocomplete():
             generation_time = end_time - start_time
             
             if predictions:
-                print(f"   ⏱️  Generation time: {generation_time:.2f}s")
-                print(f"   🔮 Predictions:")
-                for i, (pred_word, confidence) in enumerate(predictions, 1):
-                    print(f"      {i}. '{pred_word}' (confidence: {confidence:.3f})")
+                print(f"   ⏱️  Total generation time: {generation_time:.2f}s")
             else:
                 print("   ❌ No predictions generated")
         
