@@ -108,7 +108,7 @@ class LLMAutocompleteModel:
         
         try:
             # Add context to guide the model
-            context = "You are a next word predictor for special education kids who cant talk. "
+            context = "You are a next word predictor for special education kids who cant talk. Open with common sentence starter word."
             
             # Prepare the input text with context
             input_text = context + word.strip()
@@ -259,9 +259,9 @@ def main():
                     print("👋 Goodbye!")
                     break
                 
-                if not user_input:
-                    print("Please enter a word.")
-                    continue
+                # if not user_input:
+                #     print("Please enter a word.")
+                #     continue
                 
                 # Get predictions
                 print("🔄 Generating predictions...")
